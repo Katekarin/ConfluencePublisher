@@ -13,7 +13,7 @@ Create a `credentials.json` file:
 {
   "baseUrl": "https://your-domain.atlassian.net/wiki",
   "username": "your-email@example.com",
-  "apiToken": "your-api-token"
+  "apiToken": "your-ATA..-api-token"
 }
 ```
 
@@ -38,3 +38,17 @@ Optional arguments:
 - `--log-file` write logs to a specific path
 - `--mermaid-cli` path to `mmdc`
 - `--save-credentials` save current credentials to the file
+
+Recommended command:
+```bash
+dotnet run --project ConfluencePublisher.csproj -- \
+  --markdown sample.md \
+  --space [SPACEKEY] \
+  --title "[Title]" \
+  --page-id [Page ID] \
+  --base-url [URL] \
+  --username [User username] \
+  --api-token "[Token]" \
+  --mermaid-cli "[link for mermaid cli file on pc]" \
+  --log-file [link where to save log file]
+```

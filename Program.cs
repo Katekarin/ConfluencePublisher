@@ -62,6 +62,15 @@ internal static class Program
         var mermaidConverter = new MermaidConverter(options.MermaidCli, logger);
         var mermaidResult = await mermaidConverter.ReplaceMermaidBlocksAsync(markdownText);
 
+        logger.Info("=== MARKDOWN PO ZAMIANIE MERMAID (pierwsze 1500 znaków) ===");
+        logger.Info(mermaidResult.Markdown.Substring(0, Math.Min(1500, mermaidResult.Markdown.Length)) + (mermaidResult.Markdown.Length > 1500 ? "..." : ""));
+
+        logger.Info($"Liczba wygenerowanych załączników mermaid: {mermaidResult.Attachments.Count}");
+        foreach (var att in mermaidResult.Attachments)
+        {
+            logger.Info($"  - {att.FileName} ← z {att.SourcePath}");
+        }
+
         var attachments = new Dictionary<string, AttachmentInfo>(StringComparer.OrdinalIgnoreCase);
         foreach (var mermaidAttachment in mermaidResult.Attachments)
         {
@@ -164,7 +173,7 @@ internal static class Program
     {
         try
         {
-            return Uri.EscapeUriString(url);
+            return Uri.EscapeDataString(url);
         }
         catch
         {
@@ -501,6 +510,10 @@ internal sealed class ConfluenceClient : IDisposable
         var auth = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{credentials.Username}:{credentials.ApiToken}"));
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", auth);
         _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+       // _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", credentials.ApiToken);
+
+        //_httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
     }
 
     public async Task<ConfluencePage?> GetPageByTitleAsync(string spaceKey, string title)
@@ -550,43 +563,82 @@ internal sealed class ConfluenceClient : IDisposable
         return JsonSerializer.Deserialize<ConfluencePage>(body) ?? throw new InvalidOperationException("Missing create page response.");
     }
 
-    public async Task<ConfluencePage> UpdatePageAsync(string pageId, string spaceKey, string title, string parentId, string bodyStorage)
+public async Task<ConfluencePage> UpdatePageAsync(string pageId, string spaceKey, string title, string parentId, string bodyStorage)
+{
+    var current = await GetPageByIdAsync(pageId);
+    
+    _logger.Info($"W UpdatePageAsync: current == null? {current == null}");
+    _logger.Info($"W UpdatePageAsync: current.Version == null? {current?.Version == null}");
+    if (current?.Version != null)
     {
-        var current = await GetPageByIdAsync(pageId);
-        if (current == null || current.Version == null)
-        {
-            throw new InvalidOperationException("Unable to retrieve current page version.");
-        }
-
-        var payload = new
-        {
-            id = pageId,
-            type = "page",
-            title,
-            space = new { key = spaceKey },
-            ancestors = string.IsNullOrWhiteSpace(parentId) ? null : new[] { new { id = parentId } },
-            version = new { number = current.Version.Number + 1 },
-            body = new
-            {
-                storage = new
-                {
-                    value = bodyStorage,
-                    representation = "storage"
-                }
-            }
-        };
-
-        var response = await _httpClient.PutAsync($"rest/api/content/{pageId}", SerializeJson(payload));
-        var body = await response.Content.ReadAsStringAsync();
-        _logger.Info($"PUT rest/api/content/{pageId} -> {(int)response.StatusCode} {response.ReasonPhrase}");
-
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new InvalidOperationException($"Failed to update page: {body}");
-        }
-
-        return JsonSerializer.Deserialize<ConfluencePage>(body) ?? throw new InvalidOperationException("Missing update page response.");
+        _logger.Info($"W UpdatePageAsync: current.Version.Number = {current.Version.Number}");
     }
+
+    if (current == null)
+    {
+        throw new InvalidOperationException("Nie udało się pobrać strony – brak odpowiedzi.");
+    }
+
+    if (current.Version == null)
+    {
+        throw new InvalidOperationException("Strona nie ma pola version – coś jest nie tak z API.");
+    }
+
+    int reportedVersion = current.Version.Number;
+    _logger.Info($"Pobrana wersja strony: {reportedVersion} (raw z JSON)");
+
+    int nextVersion;
+
+    if (reportedVersion <= 0)
+    {
+        _logger.Warn("Wersja == 0 → prawdopodobnie mismatch camelCase/PascalCase → zakładamy wersję 1 i idziemy na 2");
+        nextVersion = 2;
+    }
+    else
+    {
+        nextVersion = reportedVersion + 1;
+    }
+
+    _logger.Info($"Będziemy wysyłać wersję: {nextVersion}");
+
+    var payload = new
+    {
+        id = pageId,
+        type = "page",
+        title,
+        space = new { key = spaceKey },
+        ancestors = string.IsNullOrWhiteSpace(parentId) ? null : new[] { new { id = parentId } },
+        version = new { number = nextVersion },
+        body = new
+        {
+            storage = new
+            {
+                value = bodyStorage,
+                representation = "storage"
+            }
+        }
+    };
+
+    var response = await _httpClient.PutAsync($"rest/api/content/{pageId}", SerializeJson(payload));
+    var responseBody = await response.Content.ReadAsStringAsync();
+
+    _logger.Info($"PUT rest/api/content/{pageId} → {(int)response.StatusCode} {response.ReasonPhrase}");
+
+    if (!response.IsSuccessStatusCode)
+    {
+        _logger.Error($"Błąd aktualizacji strony: {responseBody}");
+        throw new InvalidOperationException($"Nie udało się zaktualizować strony (status {(int)response.StatusCode}): {responseBody}");
+    }
+
+    var updatedPage = JsonSerializer.Deserialize<ConfluencePage>(responseBody);
+    if (updatedPage == null)
+    {
+        throw new InvalidOperationException("Odpowiedź z aktualizacji strony jest pusta lub nie da się zdeserializować.");
+    }
+
+    _logger.Info($"Strona zaktualizowana do wersji {updatedPage.Version?.Number ?? -1}");
+    return updatedPage;
+}
 
     public async Task UploadAttachmentAsync(string pageId, AttachmentInfo attachment)
     {
@@ -615,20 +667,35 @@ internal sealed class ConfluenceClient : IDisposable
     }
 
     private async Task<ConfluencePage?> GetPageByIdAsync(string pageId)
+{
+    var url = $"rest/api/content/{pageId}?expand=version";
+    var response = await _httpClient.GetAsync(url);
+    var body = await response.Content.ReadAsStringAsync();
+    _logger.Info($"GET {url} -> {(int)response.StatusCode} {response.ReasonPhrase}");
+
+    if (!response.IsSuccessStatusCode)
     {
-        var url = $"rest/api/content/{pageId}?expand=version";
-        var response = await _httpClient.GetAsync(url);
-        var body = await response.Content.ReadAsStringAsync();
-        _logger.Info($"GET {url} -> {(int)response.StatusCode} {response.ReasonPhrase}");
-
-        if (!response.IsSuccessStatusCode)
-        {
-            _logger.Warn(body);
-            return null;
-        }
-
-        return JsonSerializer.Deserialize<ConfluencePage>(body);
+        _logger.Warn(body);
+        return null;
     }
+
+    _logger.Info("Surowy JSON z GET page version:");
+    _logger.Info(body);
+
+    var deserializedPage = JsonSerializer.Deserialize<ConfluencePage>(body);
+    
+    _logger.Info($"Po deserializacji: Version == null? {deserializedPage?.Version == null}");
+    if (deserializedPage?.Version != null)
+    {
+        _logger.Info($"Po deserializacji: Version.Number = {deserializedPage.Version.Number}");
+    }
+    else
+    {
+        _logger.Warn("Version jest null po deserializacji – coś nie bangla z mapowaniem!");
+    }
+
+    return deserializedPage;
+}
 
     private static StringContent SerializeJson(object payload)
     {
@@ -666,10 +733,12 @@ internal sealed class ConfluenceSearchResult
 internal sealed class ConfluencePage
 {
     public string Id { get; set; } = string.Empty;
+
+    [JsonPropertyName("version")]
     public ConfluenceVersion? Version { get; set; }
 }
-
 internal sealed class ConfluenceVersion
 {
+    [JsonPropertyName("number")]
     public int Number { get; set; }
 }
